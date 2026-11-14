@@ -93,10 +93,8 @@ Provide the gateway's API key to the Codex process through the `MY_GATEWAY_API_K
 | --- | --- |
 | `base_url` | The separate inference provider that receives Codex Responses API requests. |
 | `model_catalog_url` | This adapter's full catalog URL, used to discover model metadata. |
-| `MODEL_CATALOG_MODE` | `legacy` | Discovery mode: `legacy`, `capabilities`, or `litellm`. |
-| `MODEL_CAPABILITIES_FILE` | `vllm_model_capabilities.json` | Required only in `capabilities` mode. |
-| `UPSTREAM_MODEL_INFO_URL` | `http://127.0.0.1:4000/model/info` | Full LiteLLM metadata URL, used only in `litellm` mode. |
-| `UPSTREAM_MODELS_URL` | The OpenAI-compatible model-list endpoint read by the adapter. |
+| `UPSTREAM_MODEL_INFO_URL` | The full LiteLLM `/model/info` URL, used only in `litellm` mode. |
+| `UPSTREAM_MODELS_URL` | The OpenAI-compatible model-list endpoint read in `legacy` and `capabilities` modes. |
 
 Codex may send the selected provider's authentication headers to `model_catalog_url`. This application does not validate incoming credentials; keep it bound to loopback or add authentication in front of it before deploying beyond a trusted local environment. Do not send provider credentials to an untrusted catalog endpoint.
 

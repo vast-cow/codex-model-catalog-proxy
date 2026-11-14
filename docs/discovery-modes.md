@@ -142,3 +142,34 @@ The implementation was checked against current LiteLLM documentation and source:
   modes, endpoints, explicit levels, defaults, and reasoning flags.
 - [Reasoning capability resolver](https://github.com/BerriAI/litellm/blob/main/litellm/litellm_core_utils/reasoning_effort_capability.py):
   explicit-list precedence, intersections, and the differing flag semantics.
+
+## Read-only deployment acceptance check
+
+With the adapter's Python dependencies installed, run from the repository root:
+
+```bash
+python diagnose_litellm.py "your-public-model-name" "another-public-model-name"
+```
+
+Export `UPSTREAM_MODEL_INFO_URL` and, when required, `UPSTREAM_API_KEY` in your
+local environment first. Reuse the adapter's configured values; do not paste
+credentials into a command you share. Omit model arguments to inspect all public
+names returned by the endpoint.
+
+The diagnostic performs one read-only GET and generates a catalog using the
+same LiteLLM conversion code, configured exclusions, and overrides. It uses a
+neutral Codex seed so no local CLI is required; seed metadata cannot change
+LiteLLM reasoning choices or defaults. It does not query a running adapter or
+verify inference behavior.
+
+Output is restricted to public names, deployment modes, supported endpoints,
+explicit levels, reported defaults, resulting Codex choices/defaults, and an
+explanation of empty or excluded results. Missing fields are marked `<missing>`.
+It never prints credentials, internal IDs, or `litellm_params`. For duplicates,
+array order identifies each deployment without exposing internal identifiers.
+Errors print only the exception type, avoiding response bodies and URLs.
+
+An empty result explains explicit unsupported reasoning, missing/malformed
+explicit levels, an explicit empty/invalid list, or an empty intersection across
+deployments. Excluded models and names absent from the response are identified
+separately. No fallback behavior is changed by this check.
