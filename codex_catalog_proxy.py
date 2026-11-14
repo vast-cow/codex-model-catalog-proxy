@@ -21,6 +21,11 @@ Capabilities mode requires a JSON file with the shape:
                          "reasoning_effort": {"parameter": ..., "options": ..., "default": ...}}}}
 Only models with chat_supported=true are shown, with supported reasoning options.
 
+Opt in to LiteLLM discovery with MODEL_CATALOG_MODE=litellm and the full
+UPSTREAM_MODEL_INFO_URL (default http://127.0.0.1:4000/model/info). Public
+model_name values and explicit model_info capabilities determine the catalog.
+No local capabilities file is needed. See docs/discovery-modes.md.
+
 This adapter serves ONLY the model catalog, not inference traffic. It cannot
 translate Codex reasoning.effort into arbitrary vLLM chat_template_kwargs
 or a model-specific numeric thinking budget.
@@ -45,9 +50,12 @@ UPSTREAM_MODELS_URL = os.getenv(
 UPSTREAM_API_KEY = os.getenv("UPSTREAM_API_KEY", "")
 MODEL_CAPABILITIES_FILE = os.getenv("MODEL_CAPABILITIES_FILE", "vllm_model_capabilities.json")
 MODEL_CATALOG_MODE = os.getenv("MODEL_CATALOG_MODE", "legacy").strip().lower()
-CATALOG_MODES = ("legacy", "capabilities")
+UPSTREAM_MODEL_INFO_URL = os.getenv(
+    "UPSTREAM_MODEL_INFO_URL", "http://127.0.0.1:4000/model/info"
+)
+CATALOG_MODES = ("legacy", "capabilities", "litellm")
 if MODEL_CATALOG_MODE not in CATALOG_MODES:
-    raise ValueError("MODEL_CATALOG_MODE must be 'legacy' or 'capabilities'")
+    raise ValueError("MODEL_CATALOG_MODE must be 'legacy', 'capabilities', or 'litellm'")
 CODEX_INSTRUCTIONS = os.getenv(
     "CODEX_INSTRUCTIONS",
     "You are a coding assistant. Follow the user's instructions and use available "
@@ -59,7 +67,7 @@ if SHELL_TYPE not in ("unified_exec", "disabled"):
 
 # Fixed levels advertised by the original catalog adapter (legacy mode).
 LEGACY_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
-# Accepted metadata values in capabilities mode. Not all models support these.
+# Accepted metadata values in capabilities and LiteLLM modes. Not all models support these.
 REASONING_EFFORTS = LEGACY_REASONING_EFFORTS + ("max",)
 REASONING_DESCRIPTIONS = {
     "none": "Thinking disabled",
@@ -258,6 +266,72 @@ def _effective_reasoning(capability: dict[str, Any]) -> tuple[list[str], str | N
     return options, default
 
 
+def _litellm_chat_supported(info: dict[str, Any]) -> bool:
+    """Require explicit conversational metadata, with no conflicting signal."""
+    mode = info.get("mode")
+    if mode is not None and mode not in ("chat", "responses"):
+        return False
+    endpoints = info.get("supported_endpoints")
+    if endpoints is not None:
+        if not isinstance(endpoints, list) or any(not isinstance(v, str) for v in endpoints):
+            return False
+        conversational = {"/chat/completions", "/v1/chat/completions", "/responses", "/v1/responses"}
+        if not conversational.intersection(endpoints):
+            return False
+        return True
+    return mode in ("chat", "responses")
+
+
+def _litellm_reasoning(info: dict[str, Any]) -> tuple[list[str], str | None]:
+    # Flags have endpoint/provider-specific polarity; do not reconstruct an
+    # enumeration from flags, parameter support, or request defaults.
+    raw = info.get("reasoning_effort_levels")
+    if info.get("supports_reasoning") is False or not isinstance(raw, list):
+        return [], None
+    declared = {value for value in raw if isinstance(value, str)}
+    options = [effort for effort in REASONING_EFFORTS if effort in declared]
+    default = info.get("default_reasoning_effort")
+    return options, default if isinstance(default, str) and default in options else None
+
+
+def normalize_litellm_models(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Normalize /model/info deployments, intersecting public-name capabilities.
+
+    Keep first-seen public-name order, as in the other discovery modes. Every
+    deployment must establish chat support; unknown efforts empty the intersection.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for entry in payload["data"]:
+        if not isinstance(entry, dict):
+            raise ValueError("LiteLLM deployment must be an object")
+        name = entry.get("model_name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("LiteLLM deployment must have a public model_name")
+        info = entry.get("model_info", {})
+        if info is None:
+            info = {}
+        if not isinstance(info, dict):
+            raise ValueError("LiteLLM model_info must be an object")
+        groups.setdefault(name.strip(), []).append(info)
+
+    capabilities = {}
+    for name, deployments in groups.items():
+        reasoning = [_litellm_reasoning(info) for info in deployments]
+        options = [effort for effort in REASONING_EFFORTS
+                   if all(effort in levels for levels, _ in reasoning)]
+        default = reasoning[0][1]
+        if default not in options or any(value != default for _, value in reasoning):
+            default = None
+        capabilities[name] = {
+            "chat_supported": all(_litellm_chat_supported(info) for info in deployments),
+            # No vLLM thinking toggle: this must never synthesize 'none'.
+            "thinking": {},
+            "reasoning_effort": {"parameter": "reasoning_effort", "options": options,
+                                 "default": default},
+        }
+    return {"data": [{"id": name} for name in groups]}, capabilities
+
+
 def convert_models(
     payload: dict[str, Any],
     debug_models: list[dict[str, Any]] | None = None,
@@ -266,16 +340,18 @@ def convert_models(
     *,
     mode: str | None = None,
 ) -> dict[str, Any]:
-    """Convert upstream models using legacy or opt-in capabilities metadata.
+    """Convert upstream models using legacy, file capabilities, or LiteLLM metadata.
 
     Providing `capabilities` alone does not switch modes: explicitly choose
     `mode="capabilities"`, or set MODEL_CATALOG_MODE in the environment.
     """
     mode = MODEL_CATALOG_MODE if mode is None else mode
     if mode not in CATALOG_MODES:
-        raise ValueError("mode must be 'legacy' or 'capabilities'")
+        raise ValueError("mode must be 'legacy', 'capabilities', or 'litellm'")
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise ValueError("upstream must return an object with a 'data' array")
+    if mode == "litellm":
+        payload, capabilities = normalize_litellm_models(payload)
     if debug_models is None:
         debug_models = get_debug_models()
     if not debug_models:
@@ -299,7 +375,7 @@ def convert_models(
             continue
         seen.add(slug)
 
-        if mode == "capabilities":
+        if mode in ("capabilities", "litellm"):
             # Strict filtering: never guess whether unknown models can chat.
             capability = capabilities.get(slug)
             if not isinstance(capability, dict) or capability.get("chat_supported") is not True:
@@ -393,7 +469,7 @@ def convert_models(
             )
 
         user_settings = deepcopy(overrides.get(slug, {}))
-        if mode == "capabilities":
+        if mode in ("capabilities", "litellm"):
             # Capability metadata is authoritative for model selection and efforts.
             protected = {
                 "slug", "supported_reasoning_levels", "default_reasoning_level",
@@ -435,7 +511,8 @@ async def get_codex_models():
         debug_models, overrides = results[:2]
         capabilities = results[2] if MODEL_CATALOG_MODE == "capabilities" else None
         async with httpx.AsyncClient(timeout=4.0, follow_redirects=False) as client:
-            response = await client.get(UPSTREAM_MODELS_URL, headers=headers)
+            url = UPSTREAM_MODEL_INFO_URL if MODEL_CATALOG_MODE == "litellm" else UPSTREAM_MODELS_URL
+            response = await client.get(url, headers=headers)
             response.raise_for_status()
             payload = response.json()
         return convert_models(payload, debug_models, overrides, capabilities, mode=MODEL_CATALOG_MODE)
